@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Sentinel
+GenericName=Machine Guardian
+Comment=Real-time vitals, outbound firewall and security-posture monitoring in one window
+Exec=sentinel
+Icon=sentinel
+Terminal=false
+Type=Application
+Categories=System;Security;Monitor;Network;GTK;
+StartupNotify=true
+StartupWMClass=sentinel
+Keywords=monitor;system;cpu;memory;network;firewall;outbound;egress;security;posture;hardening;
