@@ -2,7 +2,7 @@
 
 <img src="icons/sentinel.svg" width="120" alt="Sentinel">
 
-# SENTINEL
+<a href="https://github.com/effjy/sentinel/"><img src="titles/sentinel-title.svg" height="52" alt="Sentinel"></a>
 
 **One window for the whole machine, with real-time checks — live system
 vitals, a per-process outbound firewall, and continuous security-posture
