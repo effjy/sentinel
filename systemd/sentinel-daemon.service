@@ -1,0 +1,24 @@
+[Unit]
+Description=Sentinel daemon — outbound firewall + continuous security-posture scanning
+Documentation=https://github.com/effjy/sentinel
+After=network-pre.target nftables.service
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/sentinel-daemon
+# Re-scan posture this often (seconds). The scan runs on a worker thread so it
+# never stalls firewall decisions; lower it for snappier change alerts, raise it
+# to reduce the periodic filesystem sweep's cost.
+Environment=SENTINEL_SCAN_INTERVAL=60
+# The daemon removes its own nftables table on exit; restart keeps egress
+# control in place if it ever crashes. The nft rule is installed with `bypass`,
+# so while the daemon is down new connections are accepted (fail-open).
+Restart=on-failure
+RestartSec=2
+# Needs CAP_NET_ADMIN for NFQUEUE + nftables; runs as root for /proc attribution
+# and for the privileged posture checks (shadow, sudoers, full SUID sweep).
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
