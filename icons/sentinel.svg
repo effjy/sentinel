@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2f45"/>
+      <stop offset="1" stop-color="#16161e"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7aa2f7"/>
+      <stop offset="1" stop-color="#5a7fe0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- shield -->
+  <path d="M128 36 L196 64 V128 C196 172 166 204 128 220 C90 204 60 172 60 128 V64 Z"
+        fill="url(#shield)" opacity="0.16"
+        stroke="#7aa2f7" stroke-width="6" stroke-linejoin="round"/>
+  <!-- live pulse trace across the shield -->
+  <path d="M74 140 H104 L116 108 L134 168 L148 132 L158 140 H182"
+        fill="none" stroke="#9ece6a" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="182" cy="140" r="8" fill="#9ece6a"/>
+</svg>
