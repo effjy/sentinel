@@ -18,7 +18,14 @@
 //                   PBEGIN\t<scanned_at_b64>\t<c0>\t<c1>\t<c2>\t<c3>\t<c4>
 //                   PFINDING\t<sev>\t<cat_b64>\t<title_b64>\t<detail_b64>\t<sugg_b64>\t<fix_b64>
 //                   PEND
-//                   PALERT\t<sev>\t<cat_b64>\t<title_b64>      (a NEW/worsened finding)
+//                   PALERT\t<sev>\t<cat_b64>\t<title_b64>[\t<detail_b64>]
+//                       Feeds the Posture page's live "Changes" feed. Emitted both
+//                       for a NEW/worsened/cleared scan finding (no detail) and for
+//                       the two continuous watchers below (with detail): a
+//                       suspicious process exec (proc-connector) or an auth/login
+//                       event (journalctl tail) — see watch_exec()/watch_auth() in
+//                       daemon.cpp. The trailing detail field is optional so older
+//                       3-field PALERT lines still parse.
 //
 //   gui    -> daemon VERDICT\t<id>\t<allow|deny>\t<once|forever>
 //                   RULE\t<allow|deny>\t<exe>          (add/replace a stored rule)
@@ -30,7 +37,7 @@
 
 #include <string>
 
-#define SENTINEL_VERSION   "1.0.2"
+#define SENTINEL_VERSION   "1.0.5"
 #define SENTINEL_SOCK      "/run/sentinel.sock"   // created by the root daemon
 #define SENTINEL_RULES     "/etc/sentinel/rules.conf"
 #define SENTINEL_QUEUE_NUM 0                       // nfnetlink queue number

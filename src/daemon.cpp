@@ -32,11 +32,15 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <ctype.h>
-#include <linux/netlink.h>     // NETLINK_NO_ENOBUFS
+#include <linux/netlink.h>     // NETLINK_NO_ENOBUFS, NETLINK_CONNECTOR
+#include <linux/connector.h>   // cn_msg, CN_IDX_PROC / CN_VAL_PROC
+#include <linux/cn_proc.h>     // proc_event, PROC_CN_MCAST_LISTEN
 #include <signal.h>
 
 #include <cstdio>
@@ -45,6 +49,7 @@
 #include <cerrno>
 #include <ctime>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -102,6 +107,12 @@ static long                g_last_scan_ms = -1;   // monotonic time of last kick
 static std::map<std::string,int> g_prev_sev;      // category|title -> severity, last scan
 static bool                g_have_prev = false;
 static std::string         g_last_snapshot;       // framed PBEGIN..PEND, replayed on connect
+
+// ---- live watchers state (process-exec + auth/login) ----
+static int   g_exec_fd  = -1;          // proc-connector netlink socket, or -1 if unavailable
+static pid_t g_auth_pid = -1;          // child running `journalctl -f`, or -1
+static int   g_auth_fd  = -1;          // its stdout pipe, or -1 if unavailable
+static std::string g_auth_rx;          // accumulated partial line from the auth pipe
 
 // ---------------------------------------------------------------------------
 // nftables plumbing
@@ -281,6 +292,18 @@ static void emit_event(bool allow, const Conn &c, const char *reason) {
     send_line(g_client_fd, buf);
 }
 
+// Push one line into the Posture page's live "Changes" feed. Shared by the
+// scan-diff path (no detail) and the two continuous watchers below (with
+// detail) — see the PALERT description in sentinel_proto.h.
+static void send_alert(int sev, const std::string &cat, const std::string &title,
+                        const std::string &detail = "") {
+    std::string line = "PALERT\t" + std::to_string(sev) + "\t" +
+                        sentinel_b64::encode(cat) + "\t" +
+                        sentinel_b64::encode(title) + "\t" +
+                        sentinel_b64::encode(detail);
+    send_line(g_client_fd, line);
+}
+
 static long now_ms() {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
@@ -388,10 +411,7 @@ static void diff_and_emit_alerts(const ScanReport *r) {
         return p == std::string::npos ? std::string() : key.substr(0, p);
     };
     auto alert = [&](int sev, const std::string &key) {
-        std::string line = "PALERT\t" + std::to_string(sev) + "\t" +
-                           sentinel_b64::encode(cat_of(key)) + "\t" +
-                           sentinel_b64::encode(title_of(key));
-        send_line(g_client_fd, line);
+        send_alert(sev, cat_of(key), title_of(key));
     };
 
     if (g_have_prev) {
@@ -437,6 +457,295 @@ static void collect_finished_scan() {
         diff_and_emit_alerts(r);
     }
     scan_report_free(r);
+}
+
+// ---------------------------------------------------------------------------
+// Live watcher 1: process-exec monitor (kernel proc connector)
+//
+// Unlike the posture scan (interval-polled), this is push-based: the kernel
+// notifies us of every exec() on the box the moment it happens, via a
+// NETLINK_CONNECTOR socket subscribed to the proc-event multicast group. We
+// flag execs from paths a legitimate install rarely runs from — /tmp,
+// /dev/shm, /var/tmp — and execs of an already-unlinked (deleted) binary,
+// both classic signs of a dropped or memory-resident payload rather than
+// noise from normal package-manager activity.
+// ---------------------------------------------------------------------------
+static std::unordered_map<std::string, long> g_exec_cooldown;   // exe path -> last alert (ms)
+static const long EXEC_COOLDOWN_MS = 10 * 60 * 1000L;            // don't re-alert the same path for 10 min
+
+static int init_exec_watch() {
+    int fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+    if (fd < 0) {
+        fprintf(stderr, "sentinel-daemon: process-exec watch unavailable (%s)\n", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_nl addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_pid    = (uint32_t)getpid();
+    addr.nl_groups = CN_IDX_PROC;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "sentinel-daemon: process-exec watch unavailable (bind: %s)\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    // cn_msg ends in a flexible array member, so it can't be embedded as a
+    // non-last field of another struct (GCC rejects that outright). Build the
+    // subscribe message — nlmsghdr + cn_msg + a trailing uint32_t op — as a
+    // flat byte buffer instead, the usual idiom for this netlink message.
+    size_t msg_len = sizeof(struct nlmsghdr) + sizeof(struct cn_msg) + sizeof(uint32_t);
+    std::vector<unsigned char> sub(msg_len, 0);
+    struct nlmsghdr *nlh = (struct nlmsghdr *)sub.data();
+    nlh->nlmsg_len  = (uint32_t)msg_len;
+    nlh->nlmsg_pid  = (uint32_t)getpid();
+    nlh->nlmsg_type = NLMSG_DONE;
+    struct cn_msg *cn = (struct cn_msg *)NLMSG_DATA(nlh);
+    cn->id.idx = CN_IDX_PROC;
+    cn->id.val = CN_VAL_PROC;
+    cn->len    = sizeof(uint32_t);
+    *(uint32_t *)cn->data = PROC_CN_MCAST_LISTEN;
+    if (send(fd, sub.data(), msg_len, 0) < 0) {
+        fprintf(stderr, "sentinel-daemon: process-exec watch unavailable (subscribe: %s)\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Paths a normal install almost never executes from directly.
+static bool is_suspicious_exec_path(const std::string &exe) {
+    if (exe.empty()) return false;
+    if (exe.size() > 10 && exe.compare(exe.size() - 10, 10, " (deleted)") == 0)
+        return true;   // running a binary already unlinked from disk
+    static const char *bad_prefixes[] = {
+        "/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/", "/dev/mqueue/",
+    };
+    for (const char *pre : bad_prefixes)
+        if (exe.compare(0, strlen(pre), pre) == 0) return true;
+    return false;
+}
+
+static void handle_exec_event(pid_t pid) {
+    char p[64], exe[512];
+    snprintf(p, sizeof(p), "/proc/%d/exe", (int)pid);
+    ssize_t n = readlink(p, exe, sizeof(exe) - 1);
+    std::string exe_path = (n > 0) ? std::string(exe, n) : std::string();
+    if (!is_suspicious_exec_path(exe_path)) return;
+
+    long t = now_ms();
+    auto it = g_exec_cooldown.find(exe_path);
+    if (it != g_exec_cooldown.end() && (t - it->second) < EXEC_COOLDOWN_MS) return;
+    g_exec_cooldown[exe_path] = t;
+
+    std::string comm = "?", ppid = "?";
+    snprintf(p, sizeof(p), "/proc/%d/comm", (int)pid);
+    FILE *cf = fopen(p, "r");
+    if (cf) { char buf[256]; if (fgets(buf, sizeof(buf), cf)) { buf[strcspn(buf, "\n")] = 0; comm = buf; } fclose(cf); }
+    snprintf(p, sizeof(p), "/proc/%d/status", (int)pid);
+    FILE *sf = fopen(p, "r");
+    if (sf) {
+        char line[256];
+        while (fgets(line, sizeof(line), sf))
+            if (strncmp(line, "PPid:", 5) == 0) { ppid = line + 5; ppid.erase(0, ppid.find_first_not_of(" \t"));
+                                                   ppid.erase(ppid.find_last_not_of(" \t\n") + 1); break; }
+        fclose(sf);
+    }
+
+    std::string base = exe_path;
+    size_t slash = base.find_last_of('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    std::string detail = "exe=" + exe_path + "  pid=" + std::to_string((int)pid) +
+                          "  ppid=" + ppid + "  comm=" + comm;
+    send_alert(SEV_HIGH, "Process", "Execution from a suspicious path: " + base, detail);
+}
+
+// Drain and process pending proc-connector events; non-blocking, called when
+// g_exec_fd is readable.
+static void drain_exec_watch() {
+    char buf[4096];
+    for (;;) {
+        ssize_t len = recv(g_exec_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (len <= 0) break;
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        while (NLMSG_OK(nlh, (size_t)len)) {
+            if (nlh->nlmsg_type == NLMSG_NOOP) { nlh = NLMSG_NEXT(nlh, len); continue; }
+            if (nlh->nlmsg_type == NLMSG_ERROR || nlh->nlmsg_type == NLMSG_DONE) break;
+            struct cn_msg *cn = (struct cn_msg *)NLMSG_DATA(nlh);
+            struct proc_event *ev = (struct proc_event *)cn->data;
+            if (ev->what == PROC_EVENT_EXEC)
+                handle_exec_event(ev->event_data.exec.process_pid);
+            nlh = NLMSG_NEXT(nlh, len);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live watcher 2: auth/login monitor (journalctl tail)
+//
+// Tails systemd's journal for sshd/sudo/su/useradd/userdel/groupadd/usermod
+// entries as they're logged, so a login, a brute-force burst, a sudo
+// invocation or a new account shows up the moment it happens — not on the
+// next 60s posture re-scan (which only catches *configuration* drift, not
+// the fact that someone actually logged in or ran sudo).
+// ---------------------------------------------------------------------------
+struct FailWindow { std::deque<long> times; long last_alert_ms = -1; };
+static std::unordered_map<std::string, FailWindow> g_ssh_fails;   // source ip -> recent failures
+static std::unordered_map<std::string, FailWindow> g_su_fails;    // target user -> recent failures
+static const long FAIL_WINDOW_MS = 60 * 1000L;
+static const int  FAIL_THRESHOLD = 5;
+
+static void init_auth_watch() {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "sentinel-daemon: auth-log watch unavailable (pipe: %s)\n", strerror(errno));
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "sentinel-daemon: auth-log watch unavailable (fork: %s)\n", strerror(errno));
+        close(fds[0]); close(fds[1]);
+        return;
+    }
+    if (pid == 0) {
+        // Child: become `journalctl -f`, stdout feeding the pipe; stderr discarded.
+        dup2(fds[1], STDOUT_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        close(fds[0]); close(fds[1]);
+        execlp("journalctl", "journalctl", "-f", "-n0", "--no-pager", "-o", "short",
+               "-t", "sshd", "-t", "sudo", "-t", "su", "-t", "useradd",
+               "-t", "userdel", "-t", "groupadd", "-t", "usermod", (char *)nullptr);
+        _exit(127);   // no journalctl (non-systemd box) — parent sees EOF and disables the watch
+    }
+    close(fds[1]);
+    g_auth_pid = pid;
+    g_auth_fd  = fds[0];
+    int fl = fcntl(g_auth_fd, F_GETFL, 0);
+    fcntl(g_auth_fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+// "... for [invalid user ]<user> from <ip> port <n> ..." (Accepted/Failed lines)
+static bool parse_user_ip(const std::string &line, std::string &user, std::string &ip) {
+    size_t p = line.find(" for ");
+    if (p == std::string::npos) return false;
+    p += 5;
+    if (line.compare(p, 12, "invalid user") == 0) p += 13;
+    size_t sp = line.find(' ', p);
+    if (sp == std::string::npos) return false;
+    user = line.substr(p, sp - p);
+    size_t fp = line.find(" from ", sp);
+    if (fp == std::string::npos) return false;
+    fp += 6;
+    size_t fe = line.find(' ', fp);
+    ip = (fe == std::string::npos) ? line.substr(fp) : line.substr(fp, fe - fp);
+    return !user.empty() && !ip.empty();
+}
+
+static void handle_auth_line(const std::string &line) {
+    std::string user, ip;
+
+    if (line.find(" sshd") != std::string::npos || line.find("sshd[") != std::string::npos) {
+        if (line.find("Accepted ") != std::string::npos && parse_user_ip(line, user, ip)) {
+            int sev = (user == "root") ? SEV_MEDIUM : SEV_LOW;
+            send_alert(sev, "Auth", "SSH login: " + user + " from " + ip, line);
+            return;
+        }
+        if (line.find("Failed password") != std::string::npos && parse_user_ip(line, user, ip)) {
+            long t = now_ms();
+            FailWindow &w = g_ssh_fails[ip];
+            w.times.push_back(t);
+            while (!w.times.empty() && t - w.times.front() > FAIL_WINDOW_MS) w.times.pop_front();
+            if ((int)w.times.size() >= FAIL_THRESHOLD &&
+                (w.last_alert_ms < 0 || t - w.last_alert_ms > FAIL_WINDOW_MS)) {
+                w.last_alert_ms = t;
+                send_alert(SEV_HIGH, "Auth", "Possible SSH brute-force from " + ip,
+                           std::to_string(w.times.size()) + " failed logins in the last " +
+                           std::to_string(FAIL_WINDOW_MS / 1000) + "s (last user tried: " + user + ")");
+            }
+            return;
+        }
+    }
+    if (line.find(" su[") != std::string::npos || line.find(" su:") != std::string::npos) {
+        if (line.find("FAILED SU") != std::string::npos) {
+            std::string target = "?";
+            size_t p = line.find("(to ");
+            if (p != std::string::npos) {
+                p += 4;
+                size_t e = line.find(')', p);
+                if (e != std::string::npos) target = line.substr(p, e - p);
+            }
+            long t = now_ms();
+            FailWindow &w = g_su_fails[target];
+            w.times.push_back(t);
+            while (!w.times.empty() && t - w.times.front() > FAIL_WINDOW_MS) w.times.pop_front();
+            if ((int)w.times.size() >= FAIL_THRESHOLD &&
+                (w.last_alert_ms < 0 || t - w.last_alert_ms > FAIL_WINDOW_MS)) {
+                w.last_alert_ms = t;
+                send_alert(SEV_HIGH, "Auth", "Possible local su brute-force (target: " + target + ")",
+                           std::to_string(w.times.size()) + " failed `su` attempts in the last " +
+                           std::to_string(FAIL_WINDOW_MS / 1000) + "s");
+            }
+            return;
+        }
+        if (line.find("session opened") != std::string::npos) {
+            send_alert(SEV_LOW, "Auth", "su: session opened", line);
+            return;
+        }
+    }
+    if (line.find(" sudo:") != std::string::npos) {
+        size_t cp = line.find("COMMAND=");
+        size_t colon = line.find(" sudo:");
+        if (cp != std::string::npos && colon != std::string::npos) {
+            size_t us = colon + 6;
+            size_t ue = line.find(" : ", us);
+            if (ue != std::string::npos) {
+                std::string sudo_user = line.substr(us, ue - us);
+                sudo_user.erase(0, sudo_user.find_first_not_of(" \t"));
+                send_alert(SEV_LOW, "Auth", "sudo: " + sudo_user, line.substr(cp));
+            }
+        }
+        return;
+    }
+    if (line.find("useradd") != std::string::npos && line.find("new user:") != std::string::npos) {
+        send_alert(SEV_HIGH, "Auth", "New user account created", line);
+        return;
+    }
+    if (line.find("groupadd") != std::string::npos && line.find("new group:") != std::string::npos) {
+        send_alert(SEV_MEDIUM, "Auth", "New group created", line);
+        return;
+    }
+    if (line.find("userdel") != std::string::npos) {
+        send_alert(SEV_MEDIUM, "Auth", "User account removed", line);
+        return;
+    }
+    if (line.find("usermod") != std::string::npos) {
+        send_alert(SEV_MEDIUM, "Auth", "User account modified", line);
+        return;
+    }
+}
+
+static void drain_auth_watch() {
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(g_auth_fd, buf, sizeof(buf));
+        if (n > 0) {
+            g_auth_rx.append(buf, n);
+            size_t nl;
+            while ((nl = g_auth_rx.find('\n')) != std::string::npos) {
+                std::string line = g_auth_rx.substr(0, nl);
+                g_auth_rx.erase(0, nl + 1);
+                if (!line.empty()) handle_auth_line(line);
+            }
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        // n == 0 (journalctl exited, e.g. not installed) or a real error: stop watching.
+        close(g_auth_fd);
+        g_auth_fd = -1;
+        fprintf(stderr, "sentinel-daemon: auth-log watch ended (journalctl not available?)\n");
+        break;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +948,7 @@ int main() {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);   // auto-reap the journalctl child (no waitpid needed)
 
     if (const char *iv = getenv("SENTINEL_SCAN_INTERVAL")) {
         long s = strtol(iv, nullptr, 10);
@@ -682,18 +992,27 @@ int main() {
         return 1;
     }
 
-    fprintf(stderr, "sentinel-daemon %s up — queue %d, socket %s, scan every %lds\n",
-            SENTINEL_VERSION, SENTINEL_QUEUE_NUM, SENTINEL_SOCK, g_scan_interval_ms / 1000);
+    if (!getenv("SENTINEL_DISABLE_EXEC_WATCH"))
+        g_exec_fd = init_exec_watch();
+    if (!getenv("SENTINEL_DISABLE_AUTH_WATCH"))
+        init_auth_watch();
+
+    fprintf(stderr, "sentinel-daemon %s up — queue %d, socket %s, scan every %lds, "
+            "exec-watch %s, auth-watch %s\n",
+            SENTINEL_VERSION, SENTINEL_QUEUE_NUM, SENTINEL_SOCK, g_scan_interval_ms / 1000,
+            g_exec_fd >= 0 ? "on" : "off", g_auth_fd >= 0 ? "on" : "off");
 
     kick_scan_if_due(true);   // first posture scan right away
 
     char pktbuf[0x10000] __attribute__((aligned));
     while (!g_stop) {
-        struct pollfd fds[3];
+        struct pollfd fds[5];
         int n = 0;
         fds[n].fd = qfd;  fds[n].events = POLLIN; n++;
         if (lsn >= 0)         { fds[n].fd = lsn;         fds[n].events = POLLIN; n++; }
         if (g_client_fd >= 0) { fds[n].fd = g_client_fd; fds[n].events = POLLIN; n++; }
+        if (g_exec_fd >= 0)   { fds[n].fd = g_exec_fd;   fds[n].events = POLLIN; n++; }
+        if (g_auth_fd >= 0)   { fds[n].fd = g_auth_fd;   fds[n].events = POLLIN; n++; }
 
         if (poll(fds, n, 1000) < 0) { if (errno == EINTR) continue; break; }
 
@@ -707,6 +1026,10 @@ int main() {
                 accept_client(lsn);
             } else if (fds[i].fd == client_fd_snapshot && g_client_fd == client_fd_snapshot) {
                 drain_client();
+            } else if (fds[i].fd == g_exec_fd) {
+                drain_exec_watch();
+            } else if (fds[i].fd == g_auth_fd) {
+                drain_auth_watch();
             }
         }
 
@@ -722,6 +1045,9 @@ int main() {
     remove_nft();
     if (g_client_fd >= 0) close(g_client_fd);
     if (lsn >= 0) close(lsn);
+    if (g_exec_fd >= 0) close(g_exec_fd);
+    if (g_auth_fd >= 0) close(g_auth_fd);
+    if (g_auth_pid > 0) kill(g_auth_pid, SIGTERM);
     unlink(SENTINEL_SOCK);
     return 0;
 }

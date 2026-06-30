@@ -151,7 +151,8 @@ static void update_summary(Post *p) {
 // ---------------------------------------------------------------------------
 // Live "Changes" feed (PALERT)
 // ---------------------------------------------------------------------------
-static void changes_add(Post *p, int sev, const std::string &cat, const std::string &title) {
+static void changes_add(Post *p, int sev, const std::string &cat, const std::string &title,
+                         const std::string &detail = "") {
     if (!p->changes_seen) {        // drop the placeholder on first real alert
         clear_box(p->changes_box);
         p->changes_seen = true;
@@ -167,13 +168,18 @@ static void changes_add(Post *p, int sev, const std::string &cat, const std::str
         m = std::string("<span foreground='#565f89'>") + ts + "</span>  "
             "<span foreground='#9ece6a' weight='bold'>✓ cleared</span>  "
             "<b>" + ttl_e + "</b>  <span foreground='#565f89'>" + cat_e + "</span>";
-    } else {                       // a new or worsened problem
+    } else {                       // a new or worsened problem, or a live watcher event
         m = std::string("<span foreground='#565f89'>") + ts + "</span>  "
             "<span foreground='" + severity_color((Severity)sev) + "' weight='bold'>⚠ " +
             severity_name((Severity)sev) + "</span>  "
             "<b>" + ttl_e + "</b>  <span foreground='#565f89'>" + cat_e + "</span>";
     }
     g_free(cat_e); g_free(ttl_e);
+    if (!detail.empty()) {
+        char *det_e = g_markup_escape_text(detail.c_str(), -1);
+        m += std::string("\n<span foreground='#565f89' size='small'>") + det_e + "</span>";
+        g_free(det_e);
+    }
 
     GtkWidget *row = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(row), m.c_str());
@@ -218,10 +224,11 @@ void posture_on_line(const char *line) {
         gtk_widget_set_sensitive(p->pdf_btn, TRUE);
         gtk_widget_set_sensitive(p->txt_btn, TRUE);
     } else if (strncmp(line, "PALERT\t", 7) == 0) {
-        auto f = split_tabs(line + 7);   // sev, cat_b64, title_b64
+        auto f = split_tabs(line + 7);   // sev, cat_b64, title_b64, [detail_b64]
         if (f.size() >= 3)
             changes_add(p, atoi(f[0].c_str()),
-                        sentinel_b64::decode(f[1]), sentinel_b64::decode(f[2]));
+                        sentinel_b64::decode(f[1]), sentinel_b64::decode(f[2]),
+                        f.size() >= 4 ? sentinel_b64::decode(f[3]) : std::string());
     }
 }
 
