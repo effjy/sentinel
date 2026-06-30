@@ -18,7 +18,7 @@ monitoring, reunited into a single GTK4 app.**
 [![Backend: nftables + NFQUEUE](https://img.shields.io/badge/Backend-nftables%20%2B%20NFQUEUE-7dcfff?style=flat-square&labelColor=16161e)](https://www.netfilter.org/)
 [![Build: make](https://img.shields.io/badge/Build-make-f7768e?style=flat-square&labelColor=16161e)](https://www.gnu.org/software/make/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-ff9e64?style=flat-square&labelColor=16161e)](https://www.kernel.org/)
-[![Version: 1.0.2](https://img.shields.io/badge/Version-1.0.2-9ece6a?style=flat-square&labelColor=16161e)](https://github.com/effjy/sentinel/releases)
+[![Version: 1.0.5](https://img.shields.io/badge/Version-1.0.5-9ece6a?style=flat-square&labelColor=16161e)](https://github.com/effjy/sentinel/releases)
 
 </div>
 
@@ -44,12 +44,34 @@ behind one Tokyo Night window with a top-level switcher:
 |---|---|---|---|
 | **Vitals** | Pulse | CPU (total & per-core), temperature (°C/°F), memory & swap, per-filesystem disk + live I/O, network up/down & connections | 1 Hz polling of `/proc` and `/sys` |
 | **Firewall** | Warden | Pauses every *new* outbound TCP connection, names the binary and destination, and waits for your verdict; live activity log + saved-rules manager | event-driven (NFQUEUE) |
-| **Posture** | Envision | Full security-posture scan (listening ports, SSH, sudo, kernel sysctls, SUID, MAC, …) with a severity summary, findings list, and a **live "Changes" feed** | **continuous re-scan + diffing** |
+| **Posture** | Envision | Full security-posture scan (listening ports, SSH, sudo, kernel sysctls, SUID, MAC, …) with a severity summary, findings list, and a **live "Changes" feed** | **continuous re-scan + diffing**, plus two always-on push watchers (below) |
 
 The headline addition over the three originals is that **Envision's one-shot
 audit becomes a real-time monitor**: the daemon re-runs the scan on an interval,
 diffs it against the previous result, and pushes a change alert the moment a new
 problem appears (a port opens, a service fails, a SUID binary lands) — or clears.
+
+Two further watchers feed the same live "Changes" feed without waiting for a
+scan interval at all — they're push-based, driven straight by the kernel or the
+journal:
+
+- **Process-exec monitor** — subscribed to the kernel's proc-connector
+  (`NETLINK_CONNECTOR`), so every `exec()` on the box is seen the instant it
+  happens. Execs from a handful of paths a normal install never runs from
+  directly (`/tmp`, `/var/tmp`, `/dev/shm`, …) or of an already-unlinked
+  (deleted) binary — both classic signs of a dropped or memory-resident
+  payload — raise a HIGH alert naming the path, PID, parent PID and command.
+- **Auth/login monitor** — tails the systemd journal (`journalctl -f`) for
+  `sshd`, `sudo`, `su`, `useradd`, `userdel`, `groupadd` and `usermod`
+  entries: a new SSH login, a burst of failed logins from one source (a
+  possible brute-force), a sudo invocation, or a new/removed/modified
+  account all surface live, instead of only catching *configuration* drift
+  (e.g. a new NOPASSWD rule) on the next posture re-scan.
+
+Both watchers degrade gracefully if their kernel feature or `journalctl` isn't
+available (e.g. a container without `CAP_NET_ADMIN`, or a non-systemd host):
+the daemon logs a warning and keeps running with everything else intact. Either
+can be turned off with `SENTINEL_DISABLE_EXEC_WATCH=1` / `SENTINEL_DISABLE_AUTH_WATCH=1`.
 
 ---
 
@@ -60,7 +82,7 @@ Unix socket (`/run/sentinel.sock`):
 
 | Component | Runs as | Job |
 |---|---|---|
-| **`sentinel-daemon`** | root (systemd) | The firewall backend (nftables → NFQUEUE → process attribution → rule store) **and** the posture scanner. A single `poll()` loop services the firewall; posture scans run on a **worker thread** so a filesystem-wide SUID sweep never stalls a connection decision. Finished scans are framed and diffed on the main thread and streamed to the GUI. |
+| **`sentinel-daemon`** | root (systemd) | The firewall backend (nftables → NFQUEUE → process attribution → rule store), the posture scanner, **and** two live watchers (process-exec via the kernel proc-connector, auth/login via a `journalctl -f` tail). A single `poll()` loop services the firewall socket, the GUI socket, and both watcher file descriptors; posture scans run on a **worker thread** so a filesystem-wide SUID sweep never stalls a connection decision. Finished scans and watcher events are framed/diffed on the main thread and streamed to the GUI. |
 | **`sentinel`** | your user (GTK4) | The three pages. The Firewall page owns the socket and is the I/O hub: firewall traffic drives its prompt/log, and posture frames on the same socket are forwarded to the Posture page. The Vitals page needs no privileges and just reads `/proc`/`/sys`. |
 
 Design properties inherited from the originals still hold: the nftables rule is
@@ -215,7 +237,11 @@ terminal. The three tabs are selected from the switcher in the header bar.
   **Observed / Advice / Fix** detail; fixes are copy-paste shell commands.
 - The **Changes (live)** feed on the right lights up the moment your posture
   changes — a new listening port, a failed service, a fresh SUID binary — and
-  also notes when a previously-flagged problem **clears**.
+  also notes when a previously-flagged problem **clears**. The same feed also
+  carries the two push-based watchers: a suspicious process exec (path,
+  PID, parent PID, command) and auth/login events (SSH logins, brute-force
+  bursts, sudo invocations, account changes) — both shown the instant they
+  happen, with a one-line detail underneath.
 - **Scan now** forces an immediate re-scan instead of waiting for the timer.
 - **Save PDF** renders a formatted report with `pdflatex`; **Save text** writes
   a plain-text copy. (PDF needs TeX Live from step 1.)
@@ -238,7 +264,9 @@ sudo systemctl disable --now sentinel-daemon  # stop enforcing + scanning
 
 Tune the posture cadence by editing `Environment=SENTINEL_SCAN_INTERVAL=60` in
 `/etc/systemd/system/sentinel-daemon.service`, then
-`sudo systemctl daemon-reload && sudo systemctl restart sentinel-daemon`.
+`sudo systemctl daemon-reload && sudo systemctl restart sentinel-daemon`. The
+same file is where you'd add `Environment=SENTINEL_DISABLE_EXEC_WATCH=1` and/or
+`Environment=SENTINEL_DISABLE_AUTH_WATCH=1` to turn off either live watcher.
 
 > **Note:** Sentinel's firewall uses the same NFQUEUE number as the standalone
 > [Warden](https://github.com/effjy/warden). Run **one** of them at a time, not
@@ -269,6 +297,41 @@ sentinel/
 ├── Makefile
 └── README.md
 ```
+
+## Changelog
+
+### 1.0.5 (patch)
+
+- Fixed the auth/login monitor: `journalctl` was already being filtered for
+  the `su` identifier, but no handler matched those lines, so failed/successful
+  `su` attempts were silently dropped instead of alerting. `su` now gets the
+  same brute-force tracking as SSH (5+ failed `su` attempts to the same target
+  user within 60s raises a HIGH alert), plus a LOW alert on a successful `su`.
+
+### 1.0.5
+
+- **Process-exec monitor**: a new always-on watcher subscribes to the kernel's
+  proc-connector (`NETLINK_CONNECTOR`) and alerts the instant a process is
+  executed from a suspicious path (`/tmp`, `/var/tmp`, `/dev/shm`, …) or from
+  an already-deleted binary — common droppers/memory-resident-malware
+  patterns a periodic scan would miss entirely.
+- **Auth/login monitor**: a new always-on watcher tails the systemd journal
+  for `sshd`/`sudo`/`su`/`useradd`/`userdel`/`groupadd`/`usermod` and alerts
+  live on SSH logins, possible SSH brute-force bursts, sudo invocations, and
+  account creation/removal/modification.
+- Both watchers feed the existing Posture tab's "Changes (live)" feed
+  alongside scan-diff alerts, and degrade gracefully (daemon keeps running)
+  if the kernel feature or `journalctl` isn't available; either can be
+  disabled with `SENTINEL_DISABLE_EXEC_WATCH=1` / `SENTINEL_DISABLE_AUTH_WATCH=1`.
+- The `PALERT` wire message gained an optional trailing detail field (still
+  backward-compatible with the 3-field form) so these watcher events can
+  carry a one-line detail (path/PID/user/command) in the feed.
+
+### 1.0.2 and earlier
+
+- Initial unification of Pulse (vitals), Warden (firewall) and Envision
+  (posture) into Sentinel, with the posture scan turned into a continuous,
+  diffed, real-time monitor.
 
 ## Author
 
