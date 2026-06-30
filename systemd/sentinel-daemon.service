@@ -11,6 +11,12 @@ ExecStart=/usr/local/sbin/sentinel-daemon
 # never stalls firewall decisions; lower it for snappier change alerts, raise it
 # to reduce the periodic filesystem sweep's cost.
 Environment=SENTINEL_SCAN_INTERVAL=60
+# On a SINGLE-user desktop the control socket is world-connectable and the first
+# non-root process to connect becomes its owner (gated by SO_PEERCRED). On a
+# MULTI-USER machine, pin the allowed UID here: the daemon then also restricts
+# the socket to that user at the filesystem level (mode 0660), so another local
+# user can't race in and take control of the firewall. Example (uid 1000):
+#Environment=SENTINEL_ALLOW_UID=1000
 # The daemon removes its own nftables table on exit; restart keeps egress
 # control in place if it ever crashes. The nft rule is installed with `bypass`,
 # so while the daemon is down new connections are accepted (fail-open).
