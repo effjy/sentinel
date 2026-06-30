@@ -18,7 +18,7 @@ monitoring, reunited into a single GTK4 app.**
 [![Backend: nftables + NFQUEUE](https://img.shields.io/badge/Backend-nftables%20%2B%20NFQUEUE-7dcfff?style=flat-square&labelColor=16161e)](https://www.netfilter.org/)
 [![Build: make](https://img.shields.io/badge/Build-make-f7768e?style=flat-square&labelColor=16161e)](https://www.gnu.org/software/make/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-ff9e64?style=flat-square&labelColor=16161e)](https://www.kernel.org/)
-[![Version: 1.0.0](https://img.shields.io/badge/Version-1.0.0-9ece6a?style=flat-square&labelColor=16161e)](https://github.com/effjy/sentinel/releases)
+[![Version: 1.0.2](https://img.shields.io/badge/Version-1.0.2-9ece6a?style=flat-square&labelColor=16161e)](https://github.com/effjy/sentinel/releases)
 
 </div>
 
