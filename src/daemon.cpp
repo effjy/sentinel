@@ -743,6 +743,9 @@ static void drain_auth_watch() {
         // n == 0 (journalctl exited, e.g. not installed) or a real error: stop watching.
         close(g_auth_fd);
         g_auth_fd = -1;
+        // Reap the journalctl child so it doesn't linger as a zombie (SIGCHLD is
+        // at its default disposition, so children are not auto-reaped).
+        if (g_auth_pid > 0) { waitpid(g_auth_pid, nullptr, 0); g_auth_pid = -1; }
         fprintf(stderr, "sentinel-daemon: auth-log watch ended (journalctl not available?)\n");
         break;
     }
@@ -948,7 +951,13 @@ int main() {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);   // auto-reap the journalctl child (no waitpid needed)
+    // Leave SIGCHLD at its default. Setting it to SIG_IGN makes the kernel
+    // auto-reap every child, which breaks g_spawn_sync() in the posture scanner:
+    // its internal waitpid() then fails with ECHILD on every command it runs
+    // (flooding the journal and discarding each command's exit status). We reap
+    // the one long-lived child we fork ourselves — the journalctl auth-watch —
+    // explicitly in drain_auth_watch() and at shutdown instead.
+    signal(SIGCHLD, SIG_DFL);
 
     if (const char *iv = getenv("SENTINEL_SCAN_INTERVAL")) {
         long s = strtol(iv, nullptr, 10);
@@ -1047,7 +1056,7 @@ int main() {
     if (lsn >= 0) close(lsn);
     if (g_exec_fd >= 0) close(g_exec_fd);
     if (g_auth_fd >= 0) close(g_auth_fd);
-    if (g_auth_pid > 0) kill(g_auth_pid, SIGTERM);
+    if (g_auth_pid > 0) { kill(g_auth_pid, SIGTERM); waitpid(g_auth_pid, nullptr, 0); }
     unlink(SENTINEL_SOCK);
     return 0;
 }
