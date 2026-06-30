@@ -19,6 +19,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -60,7 +61,13 @@ static std::vector<std::string> split_tabs(const std::string &s) {
 static void send_line(App *app, const std::string &s) {
     if (app->sock_fd < 0) return;
     std::string l = s + "\n";
-    if (write(app->sock_fd, l.data(), l.size()) < 0) { /* daemon gone; ignore */ }
+    size_t off = 0;
+    while (off < l.size()) {                       // loop on short writes
+        ssize_t w = write(app->sock_fd, l.data() + off, l.size() - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        break;                                     // daemon gone; ignore
+    }
 }
 
 // Exposed to posture.cpp so it can ask the daemon to scan immediately.
@@ -112,12 +119,13 @@ static void reload_rules(App *app) {
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
         if (line[0] == '#' || line[0] == 0) continue;
-        char verb[8], sha[80];
-        if (sscanf(line, "%7s %79s", verb, sha) != 2) continue;
-        char *exe = strstr(line, sha);
-        if (!exe) continue;
-        exe += strlen(sha);
+        char verb[8], sha[80]; int pos = 0;
+        // Pick the path up right after the verb+sha fields (via %n) rather than
+        // re-finding the sha by substring, which can land in the wrong place.
+        if (sscanf(line, "%7s %79s %n", verb, sha, &pos) < 2 || pos == 0) continue;
+        char *exe = line + pos;
         while (*exe == ' ') ++exe;
+        if (!*exe) continue;
 
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
         gtk_widget_set_margin_top(row, 4); gtk_widget_set_margin_bottom(row, 4);

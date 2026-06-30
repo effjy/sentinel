@@ -30,7 +30,7 @@
 
 #include <string>
 
-#define SENTINEL_VERSION   "1.0.0"
+#define SENTINEL_VERSION   "1.0.2"
 #define SENTINEL_SOCK      "/run/sentinel.sock"   // created by the root daemon
 #define SENTINEL_RULES     "/etc/sentinel/rules.conf"
 #define SENTINEL_QUEUE_NUM 0                       // nfnetlink queue number

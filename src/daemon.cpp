@@ -30,11 +30,13 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <poll.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <linux/netlink.h>     // NETLINK_NO_ENOBUFS
 #include <signal.h>
 
 #include <cstdio>
@@ -137,11 +139,13 @@ static void load_rules() {
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
         if (line[0] == '#' || line[0] == 0) continue;
-        char verb[8], sha[80]; char *exe = nullptr;
-        if (sscanf(line, "%7s %79s", verb, sha) != 2) continue;
-        exe = strstr(line, sha);
-        if (!exe) continue;
-        exe += strlen(sha);
+        char verb[8], sha[80]; int pos = 0;
+        // %n records where parsing stopped, so we pick up the path right after the
+        // verb+sha fields instead of re-finding the sha by substring (which could
+        // match the wrong spot — e.g. a path-only "-" rule whose path contains a
+        // dash).
+        if (sscanf(line, "%7s %79s %n", verb, sha, &pos) < 2 || pos == 0) continue;
+        char *exe = line + pos;
         while (*exe == ' ') ++exe;
         if (!*exe) continue;
         Rule r; r.allow = (strcmp(verb, "allow") == 0);
@@ -254,8 +258,20 @@ static bool inode_to_proc(unsigned long inode, Conn &c) {
 // ---------------------------------------------------------------------------
 // GUI socket helpers
 // ---------------------------------------------------------------------------
+// Write a whole line, looping on short writes so a large posture snapshot is
+// never truncated mid-frame. The client socket carries SO_SNDTIMEO, so a wedged
+// GUI makes write() fail (EAGAIN) instead of stalling the firewall poll loop
+// forever; on any non-EINTR error we just give up and let the loop reap the fd.
 static void send_line(int fd, const std::string &s) {
-    if (fd >= 0) { std::string l = s + "\n"; (void)!write(fd, l.data(), l.size()); }
+    if (fd < 0) return;
+    std::string l = s + "\n";
+    size_t off = 0;
+    while (off < l.size()) {
+        ssize_t w = write(fd, l.data() + off, l.size() - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        break;   // EAGAIN (send timeout) / EPIPE / other: drop, fd is reaped later
+    }
 }
 
 static void emit_event(bool allow, const Conn &c, const char *reason) {
@@ -451,6 +467,15 @@ static void drain_client(void) {
         return;
     }
     g_rx.append(buf, n);
+    // Control lines from the GUI are tiny; a client that streams megabytes with
+    // no newline is misbehaving. Cap the accumulator and drop it rather than
+    // letting it grow without bound.
+    if (g_rx.size() > (1u << 20)) {
+        fprintf(stderr, "sentinel-daemon: client overran receive buffer; dropping it\n");
+        close(g_client_fd); g_client_fd = -1; g_rx.clear();
+        resolve_all_pending("gui-gone-default");
+        return;
+    }
     size_t nl;
     while ((nl = g_rx.find('\n')) != std::string::npos) {
         std::string line = g_rx.substr(0, nl);
@@ -553,7 +578,19 @@ static int make_listener() {
     a.sun_family = AF_UNIX;
     strncpy(a.sun_path, SENTINEL_SOCK, sizeof(a.sun_path) - 1);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
-    chmod(SENTINEL_SOCK, 0666);
+    // If the owner UID is pinned (SENTINEL_ALLOW_UID), lock the socket down at the
+    // filesystem level too: only that user (and root) can even connect, so a
+    // racing local user can't claim control. Without it we fall back to the
+    // permissive, world-connectable model gated only by SO_PEERCRED's
+    // first-non-root-connector rule in accept_client().
+    if (g_owner_uid != (uid_t)-1) {
+        if (chown(SENTINEL_SOCK, g_owner_uid, (gid_t)-1) != 0)
+            fprintf(stderr, "sentinel-daemon: chown(%s) failed: %s\n",
+                    SENTINEL_SOCK, strerror(errno));
+        chmod(SENTINEL_SOCK, 0660);
+    } else {
+        chmod(SENTINEL_SOCK, 0666);
+    }
     if (listen(fd, 4) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -574,7 +611,17 @@ static void accept_client(int lsn) {
         return;
     }
 
-    if (g_client_fd >= 0) close(g_client_fd);
+    // A wedged GUI must not block the firewall poll loop on write(); bound every
+    // send to a couple of seconds.
+    struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (g_client_fd >= 0) {
+        // A previous GUI is being replaced: release any connections it left held
+        // in NFQUEUE so they don't sit stalled until their prompt timeout.
+        resolve_all_pending("gui-replaced-default");
+        close(g_client_fd);
+    }
     g_client_fd = c;
     g_rx.clear();
     send_line(g_client_fd, "HELLO\t" SENTINEL_VERSION);
@@ -616,8 +663,24 @@ int main() {
         g_owner_uid = (uid_t)strtoul(env, nullptr, 10);
 
     int qfd = nfq_fd(h);
+
+    // Under load NFQUEUE can overrun the netlink receive buffer; asking the kernel
+    // not to deliver ENOBUFS keeps the queue flowing instead of dropping us into
+    // an error path on every burst.
+#ifdef NETLINK_NO_ENOBUFS
+    { int one = 1; setsockopt(qfd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &one, sizeof(one)); }
+#endif
+
     int lsn = make_listener();
-    if (lsn < 0) { fprintf(stderr, "could not create %s\n", SENTINEL_SOCK); }
+    if (lsn < 0) {
+        // Without the control socket no GUI can ever attach, so every new
+        // connection would silently hit the fail-open default — the firewall
+        // would appear up while enforcing nothing. Refuse to run in that state.
+        fprintf(stderr, "sentinel-daemon: could not create %s; refusing to run "
+                "with the firewall effectively disabled\n", SENTINEL_SOCK);
+        nfq_destroy_queue(qh); nfq_close(h); remove_nft();
+        return 1;
+    }
 
     fprintf(stderr, "sentinel-daemon %s up — queue %d, socket %s, scan every %lds\n",
             SENTINEL_VERSION, SENTINEL_QUEUE_NUM, SENTINEL_SOCK, g_scan_interval_ms / 1000);
