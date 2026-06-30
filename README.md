@@ -302,6 +302,15 @@ sentinel/
 
 ### 1.0.5 (patch)
 
+- Fixed a flood of `g_spawn_sync() … ECHILD … waitpid()` warnings from the
+  daemon. The daemon set `SIGCHLD` to `SIG_IGN` to auto-reap the long-lived
+  `journalctl` auth-watch child, but that disposition also made the kernel
+  reap the short-lived children spawned by the posture scanner's `run_cmd()`
+  (`ss`, `apt-get -s`, …) before `g_spawn_sync()` could `waitpid()` for them —
+  so every scan logged a burst of ECHILD warnings and lost each command's exit
+  status. `SIGCHLD` is now left at its default and the `journalctl` child is
+  reaped explicitly (in `drain_auth_watch()` on EOF and at shutdown).
+
 - Fixed the auth/login monitor: `journalctl` was already being filtered for
   the `su` identifier, but no handler matched those lines, so failed/successful
   `su` attempts were silently dropped instead of alerting. `su` now gets the
